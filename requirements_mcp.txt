@@ -1,0 +1,19 @@
+# MCP Server Dependencies
+fastmcp>=0.2.0
+mcp>=1.0.0
+
+# Superlinked and Vector DB
+superlinked
+qdrant-client
+
+# Data Processing
+pandas
+numpy
+
+# Utilities
+python-dotenv
+
+# Already in requirements.txt but included for completeness
+sentence-transformers
+torch
+openai
