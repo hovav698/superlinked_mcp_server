@@ -1,15 +1,18 @@
 """
-Dynamic Superlinked app with InMemory VectorDB.
-Reads index config from environment variable (passed directly from MCP tool).
+Dynamic Superlinked app with InMemoryExecutor.
+Creates an in-memory search app without REST API server.
 """
 from superlinked import framework as sl
 from datetime import timedelta
 from pathlib import Path
-import json
-import os
 import pandas as pd
-from typing import Dict, Any, Optional, List, Tuple, Union
+import sys
+from typing import Dict, Any, Optional, List, Tuple
 from config import *
+
+# Helper to print to stderr (not stdout, which would break MCP protocol)
+def log(msg):
+    print(msg, file=sys.stderr)
 
 
 def load_csv_if_needed(csv_filename: Optional[str], column_mapping: Dict[str, str]) -> Optional[pd.DataFrame]:
@@ -25,7 +28,7 @@ def load_csv_if_needed(csv_filename: Optional[str], column_mapping: Dict[str, st
     try:
         return pd.read_csv(csv_filename)
     except Exception as e:
-        print(f"⚠ Could not load CSV {csv_filename}: {e}")
+        log(f"⚠ Could not load CSV {csv_filename}: {e}")
         return None
 
 
@@ -92,7 +95,7 @@ def create_number_space(schema: sl.Schema, col: str) -> Tuple[sl.Space, Dict]:
 def create_category_space(schema: sl.Schema, col: str, df: Optional[pd.DataFrame]) -> Optional[Tuple[sl.Space, Dict]]:
     """Create a category space for a categorical column."""
     if df is None or col not in df.columns:
-        print(f"⚠ Skipping category space for {col}: no data available")
+        log(f"⚠ Skipping category space for {col}: no data available")
         return None
 
     categories = df[col].dropna().unique().tolist()
@@ -141,8 +144,8 @@ def create_spaces(schema: sl.Schema, column_mapping: Dict[str, str], df: Optiona
     return spaces, weights, text_space  # text_space needed separately for query
 
 
-def create_query(index: sl.Index, schema: sl.Schema, weights: Dict, text_space: Any, index_name: str) -> Optional[sl.RestQuery]:
-    """Create a REST query for the index."""
+def create_query(index: sl.Index, schema: sl.Schema, weights: Dict, text_space: Any) -> Optional[sl.Query]:
+    """Create a query for the index."""
     if not text_space:
         return None
 
@@ -154,35 +157,34 @@ def create_query(index: sl.Index, schema: sl.Schema, weights: Dict, text_space: 
         .limit(sl.Param("limit"))
     )
 
-    return sl.RestQuery(
-        sl.RestDescriptor(f"{index_name}_query"),
-        query
-    )
+    return query
 
 
-def create_data_sources(schema: sl.Schema) -> List:
+def create_data_source(schema: sl.Schema) -> sl.InMemorySource:
     """
-    Create data sources for the schema.
-
-    Only RestSource - data loaded manually via ingest_csv_data().
-    DataLoaderSource doesn't work reliably (CSV not loading).
+    Create an in-memory data source for the schema.
+    Data will be loaded directly via source.put() method.
     """
-    # RestSource creates HTTP endpoint for manual data ingestion
-    return [sl.RestSource(schema)]
+    return sl.InMemorySource(schema)
 
 
-def process_single_index(index_name: str, metadata: Dict[str, Any]) -> Tuple[Optional[sl.Index], Optional[sl.RestQuery], List]:
-    """Process a single index from metadata and return index, query, and sources."""
-    csv_filename = metadata.get("csv_filename")
-    column_mapping = metadata.get("column_mapping", {})
+def create_index_components(index_name: str, column_mapping: Dict[str, str], csv_path: Optional[str] = None):
+    """
+    Create all components for an index: schema, index, query, and source.
 
-    print(f"Processing index: {index_name}, CSV: {csv_filename}")
+    Args:
+        index_name: Name of the index
+        column_mapping: Mapping of columns to space types
+        csv_path: Optional path to CSV for category detection
 
+    Returns:
+        Tuple of (schema, index, query, source, text_space)
+    """
     if not column_mapping:
-        return None, None, []
+        raise ValueError("column_mapping is required")
 
     # Load CSV if needed for category detection
-    df = load_csv_if_needed(csv_filename, column_mapping)
+    df = load_csv_if_needed(csv_path, column_mapping)
 
     # Create schema
     schema_fields = build_schema_fields(column_mapping)
@@ -192,69 +194,47 @@ def process_single_index(index_name: str, metadata: Dict[str, Any]) -> Tuple[Opt
     spaces, weights, text_space = create_spaces(schema, column_mapping, df)
 
     if not spaces:
-        print(f"⚠ No valid spaces created for {index_name}")
-        return None, None, []
+        raise ValueError(f"No valid spaces created for {index_name}")
 
     # Create index
     index = sl.Index(spaces)
 
     # Create query
-    query = create_query(index, schema, weights, text_space, index_name)
+    query = create_query(index, schema, weights, text_space)
 
-    # Create data sources (REST endpoint only - manual ingestion)
-    sources = create_data_sources(schema)
+    # Create data source
+    source = create_data_source(schema)
 
-    print(f"✓ Loaded index: {index_name}")
-    return index, query, sources
+    log(f"✓ Created index components for: {index_name}")
+    return schema, index, query, source, text_space
 
 
-def initialize_server():
-    """Initialize Superlinked server. Loads indexes from environment variable if present."""
-    all_indices = []
-    all_queries = []
-    all_sources = []
+def create_app(index_name: str, column_mapping: Dict[str, str], csv_path: Optional[str] = None):
+    """
+    Create an InMemoryExecutor app for the given index configuration.
 
-    # Read metadata from environment variable (passed by MCP tool)
-    metadata_json = os.environ.get('INDEX_METADATA')
-    if metadata_json:
-        try:
-            all_metadata = json.loads(metadata_json)
+    Args:
+        index_name: Name of the index
+        column_mapping: Mapping of columns to space types
+        csv_path: Optional path to CSV for category detection
 
-            # Get the single index (only one per server instance)
-            if len(all_metadata) != 1:
-                print(f"⚠ Warning: Expected 1 index, found {len(all_metadata)}")
-
-            index_name, index_config = next(iter(all_metadata.items()))
-            print(f"✓ Loading index: {index_name}")
-
-            index, query, sources = process_single_index(index_name, index_config)
-
-            if index:
-                all_indices.append(index)
-            if query:
-                all_queries.append(query)
-            all_sources.extend(sources)
-
-        except Exception as e:
-            print(f"⚠ Could not load index: {e}")
-
-    # Create executor
-    vector_db = sl.InMemoryVectorDatabase()
-
-    executor = sl.RestExecutor(
-        sources=all_sources,
-        indices=all_indices,
-        queries=all_queries,
-        vector_database=vector_db
+    Returns:
+        Tuple of (app, source, query) where:
+        - app: The InMemoryApp instance with .query() method
+        - source: The InMemorySource for ingesting data via source.put()
+        - query: The Query object for passing to app.query()
+    """
+    schema, index, query, source, text_space = create_index_components(
+        index_name, column_mapping, csv_path
     )
 
-    sl.SuperlinkedRegistry.register(executor)
+    # Create executor and run it to get an app
+    executor = sl.InMemoryExecutor(
+        sources=[source],
+        indices=[index]
+    )
 
-    if all_indices:
-        print(f"✓ Server ready with {len(all_indices)} index(es)")
-    else:
-        print("✓ Server ready (empty - use MCP create_index tool)")
+    app = executor.run()
 
-
-# Initialize the server
-initialize_server()
+    log(f"✓ Created InMemoryExecutor app for: {index_name}")
+    return app, source, query

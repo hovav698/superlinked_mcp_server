@@ -1,24 +1,26 @@
 """
-Superlinked MCP Server - Clean and organized.
-Uses InMemory VectorDB with dynamic index creation.
+Superlinked MCP Server - InMemoryExecutor version.
+Uses InMemoryExecutor with direct Python API (no REST server).
 """
 from fastmcp import FastMCP
 import pandas as pd
 from pathlib import Path
 import json
 import sys
-import time
 
-# Import config and utils
+# Import config and app
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import *
-from mcp_utils import (
-    start_superlinked_server,
-    wait_for_server,
-    ingest_csv_data
-)
+from app import create_app
+
+# Helper to print to stderr (not stdout, which breaks MCP protocol)
+def log(msg):
+    print(msg, file=sys.stderr)
 
 mcp = FastMCP("Superlinked RAG Server")
+
+# Store active app instances
+_active_apps = {}
 
 
 @mcp.tool()
@@ -46,7 +48,7 @@ def preview_csv(csv_path: str, rows: int = 5) -> str:
 @mcp.tool()
 def create_index(csv_path: str, column_mapping: dict) -> str:
     """
-    Create index from CSV with manual data ingestion.
+    Create index from CSV using InMemoryExecutor.
     Space types: 'text_similarity', 'recency', 'number', 'category'
 
     Args:
@@ -57,73 +59,62 @@ def create_index(csv_path: str, column_mapping: dict) -> str:
         index_name = Path(csv_path).stem
         df = pd.read_csv(csv_path)
 
+        # Validate columns
         final_mapping = {}
         for col, space_type in column_mapping.items():
             if col not in df.columns:
                 return json.dumps({"error": f"Column '{col}' not found in CSV"})
             final_mapping[col] = space_type
 
-        # Prepare metadata to pass to server via environment variable
-        metadata = {
-            index_name: {
-                "csv_filename": Path(csv_path).name,
-                "column_mapping": final_mapping
-            }
+        # Create app with InMemoryExecutor
+        log(f"Creating InMemoryExecutor app for {index_name}...")
+        app, source, query = create_app(index_name, final_mapping, csv_path)
+
+        # Ingest data via InMemorySource
+        log(f"Ingesting {len(df)} rows...")
+        ingested = 0
+        errors = 0
+
+        for _, row in df.iterrows():
+            try:
+                # Build row dict with id + mapped columns
+                row_dict = {'id': str(row.get('id', row.name))}
+
+                for col in final_mapping.keys():
+                    if col in row.index and not pd.isna(row[col]):
+                        value = row[col]
+                        # Convert timestamps to int if needed
+                        if final_mapping[col] == 'recency':
+                            row_dict[col] = int(value)
+                        else:
+                            row_dict[col] = value
+
+                # Use source.put() to ingest
+                source.put([row_dict])
+                ingested += 1
+            except Exception as e:
+                errors += 1
+                log(f"  Error ingesting row: {e}")
+
+        # Store app instance for querying
+        _active_apps[index_name] = {
+            'app': app,
+            'query': query,
+            'source': source
         }
-
-        # Start server and pass metadata directly
-        print(f"Starting server for {index_name}...")
-        start_superlinked_server(metadata)
-
-        # Wait for server startup
-        if not wait_for_server():
-            return json.dumps({"error": "Server failed to start"})
-
-        # Wait for index initialization
-        print(f"Waiting for index initialization...")
-        time.sleep(3)
-
-        # Manually ingest data via REST API
-        print(f"Ingesting {len(df)} rows...")
-        result = ingest_csv_data(csv_path, index_name, final_mapping)
 
         return json.dumps({
             "status": "success",
             "index_name": index_name,
             "columns": final_mapping,
             "rows": len(df),
-            "ingested": result["ingested"],
-            "errors": result["errors"]
+            "ingested": ingested,
+            "errors": errors
         }, indent=2)
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-
-@mcp.tool()
-def list_indexes() -> str:
-    """List all available indexes. Note: Indexes are not persisted - created on demand."""
-    try:
-        import requests
-
-        # Check if server is running
-        try:
-            r = requests.get(f"http://localhost:{SERVER_PORT}/health", timeout=2)
-            if r.status_code == 200:
-                return json.dumps({
-                    "status": "Server running",
-                    "message": "Indexes are created on-demand and not persisted. Use create_index to index data."
-                }, indent=2)
-        except:
-            pass
-
-        return json.dumps({
-            "status": "Server not running",
-            "message": "Use create_index to start server and index data."
-        }, indent=2)
-
-    except Exception as e:
-        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
@@ -137,33 +128,32 @@ def query_index(index_name: str, query_text: str, limit: int = 5) -> str:
         limit: Max results (default: 5)
     """
     try:
-        import requests
-
-        # Check if server is running
-        try:
-            r = requests.get(f"http://localhost:{SERVER_PORT}/health", timeout=2)
-            if r.status_code != 200:
-                return json.dumps({"error": "Server not running. Create an index first using create_index."})
-        except:
-            return json.dumps({"error": "Server not running. Create an index first using create_index."})
-
-        # Query
-        url = f"http://localhost:{SERVER_PORT}/api/v1/search/{index_name}_query"
-        payload = {"search_query": query_text, "limit": limit}
-
-        response = requests.post(url, json=payload, timeout=30)
-        response.raise_for_status()
-
-        results = response.json()
-        entries = results.get('entries', [])
-
-        parsed = []
-        for entry in entries:
-            parsed.append({
-                "id": entry.get("id"),
-                "score": entry.get("metadata", {}).get("score", 0),
-                "fields": entry.get("fields", {})
+        # Check if index exists
+        if index_name not in _active_apps:
+            return json.dumps({
+                "error": f"Index '{index_name}' not found. Create it first using create_index.",
+                "available_indexes": list(_active_apps.keys())
             })
+
+        # Get app and query
+        app_data = _active_apps[index_name]
+        app = app_data['app']
+        query = app_data['query']
+
+        # Execute query directly via Python API
+        result = app.query(query, search_query=query_text, limit=limit)
+
+        # Parse QueryResult - it's iterable with ('entries', [ResultEntry, ...])
+        parsed = []
+        for key, value in result:
+            if key == 'entries':
+                for entry in value:
+                    parsed.append({
+                        "id": entry.id,
+                        "score": entry.metadata.score,
+                        "fields": entry.fields
+                    })
+                break
 
         return json.dumps(parsed, indent=2)
 
