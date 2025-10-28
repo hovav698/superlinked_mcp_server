@@ -1,310 +1,302 @@
 """
-Superlinked MCP Server
-Provides tools for creating and querying RAG indexes using Superlinked and Qdrant.
+Simplified Superlinked MCP Server
+All functionality inline - no separate utils needed.
 """
 from fastmcp import FastMCP
 import pandas as pd
 from pathlib import Path
-from typing import Dict, Optional, List, Any, Union
+from typing import Dict, List, Any
 import json
+import subprocess
+import time
+import requests
+import sys
+import os
+import uuid
 
-from superlinked_utils import (
-    list_indexes,
-    create_index_and_load,
-    query_index
-)
+from config import *
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 
-# Initialize FastMCP server
 mcp = FastMCP("Superlinked RAG Server")
 
 
+def detect_column_type(df: pd.DataFrame, col: str) -> str:
+    """Auto-detect column type from pandas dtype."""
+    dtype = str(df[col].dtype)
+
+    # Check for timestamp
+    if 'datetime' in dtype:
+        return 'recency'
+
+    # Check for numeric
+    if 'float' in dtype or 'int' in dtype:
+        # If it looks like a score (0-1 range), treat as number space
+        if df[col].between(0, 1).all():
+            return 'number'
+        return 'number'
+
+    # Check for categorical (string with low cardinality)
+    if dtype == 'object' or 'str' in dtype:
+        unique_ratio = len(df[col].dropna().unique()) / len(df[col].dropna())
+        # If less than 10% unique values, likely categorical
+        if unique_ratio < 0.1:
+            return 'category'
+
+    # Default to text
+    return 'text_similarity'
+
+
+def get_qdrant_client():
+    """Get Qdrant client instance."""
+    return QdrantClient(url=QDRANT_URL)
+
+
 @mcp.tool()
-def preview_csv(csv_path: str) -> str:
+def preview_csv(csv_path: str, rows: int = 5) -> str:
     """
-    Preview the first few rows of a CSV file to understand its structure and columns.
-
-    ⚠️ CRITICAL: If list_available_indexes returns NO index for this CSV file, you MUST call this tool BEFORE any other
-    Claude Desktop internal tool (like Read, Glob, etc.). Do NOT use Read or any other built-in tool to inspect the CSV.
-
-    This MCP tool is specifically designed to analyze CSV structure for indexing and MUST be used instead of
-    Claude Desktop's internal file reading tools when preparing to create an index.
-
-    This tool is REQUIRED before calling create_index to determine:
-    - Which columns exist in the CSV
-    - The data type of each column (text, timestamp, number)
-    - Sample values to understand the data format
-    - Appropriate column-to-space type mappings for indexing
-
-    MANDATORY USAGE PATTERN:
-    1. User asks about indexing/querying a CSV file
-    2. Call list_available_indexes FIRST to check if index exists
-    3. ⚠️ If index does NOT exist, call preview_csv IMMEDIATELY - do NOT use Read, Glob, or other tools
-    4. Use the column information from preview_csv to decide column_mapping for create_index
-    5. Then call create_index with the correct mappings
-
-    This tool shows the first 10 rows, column names, data types, and sample values.
+    Preview CSV file contents.
 
     Args:
-        csv_path: Absolute path to the CSV file to preview
-
-    Returns:
-        JSON string containing: first 10 rows as dict, column names, data types, and sample values
-
-    Example:
-        preview_csv("/path/to/data.csv")
+        csv_path: Path to CSV file
+        rows: Number of rows to preview (default: 5)
     """
     try:
-        # Validate path
-        path = Path(csv_path)
-        if not path.exists():
-            return json.dumps({
-                "error": f"File not found: {csv_path}",
-                "suggestion": "Please provide the full absolute path to the CSV file"
-            })
-
-        if not path.suffix.lower() == '.csv':
-            return json.dumps({
-                "error": f"File is not a CSV: {csv_path}",
-                "suggestion": "Only CSV files are supported"
-            })
-
-        # Read CSV
         df = pd.read_csv(csv_path)
-
-        # Get column info
-        column_info = {}
-        for col in df.columns:
-            dtype = str(df[col].dtype)
-            sample_value = str(df[col].iloc[0]) if len(df) > 0 else "N/A"
-            column_info[col] = {
-                "dtype": dtype,
-                "sample": sample_value
-            }
-
-        # Prepare response
-        result = {
-            "filename": path.name,
-            "total_rows": len(df),
+        preview = {
+            "rows": len(df),
             "columns": list(df.columns),
-            "column_info": column_info,
-            "preview": df.head(10).to_dict(orient='records')
+            "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+            "preview": df.head(rows).to_dict('records')
         }
-
-        return json.dumps(result, indent=2)
-
+        return json.dumps(preview, indent=2)
     except Exception as e:
-        return json.dumps({
-            "error": str(e),
-            "type": type(e).__name__
-        })
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
-def create_index(
-    csv_path: str,
-    column_mapping: Dict[str, str],
-    weights: Optional[Union[Dict[str, float], str]] = None,
-    recreate: bool = False
-) -> str:
+def create_index(csv_path: str, column_mapping: Dict[str, str], recreate: bool = False) -> str:
     """
-    Create a Superlinked index for a CSV file with specified column-to-space mappings.
-
-    IMPORTANT: Only call this tool AFTER:
-    1. list_available_indexes confirms the index does NOT exist (or you want to recreate it)
-    2. preview_csv has been called to inspect the CSV structure
-
-    This tool creates a vector index in Qdrant using Superlinked's multi-space indexing.
-    The index name will be the same as the CSV filename (without extension).
-
-    If the index already exists and recreate=False, this tool will return an error message.
-    If recreate=True, the existing index will be deleted and recreated with new settings.
-
-    ⚠️ CRITICAL: Space Types - ONLY these values are allowed:
-    The column_mapping values MUST be one of these three exact strings (case-sensitive):
-    - "text_similarity": For text fields that should be semantically searchable
-    - "recency": For timestamp fields to favor recent documents
-    - "number": For numerical fields to optimize by value (e.g., usefulness scores)
-
-    NO OTHER VALUES ARE ALLOWED. Using any other value will result in an error.
+    Create index from CSV. Auto-detects types if not specified.
+    Space types: 'text_similarity', 'recency', 'number', 'category'
 
     Args:
-        csv_path: Absolute path to the CSV file
-        column_mapping: Dictionary mapping column names to space types.
-                       ⚠️ VALUES MUST BE EXACTLY: "text_similarity", "recency", or "number" (no other values allowed)
-                       Example: {"body": "text_similarity", "created_at": "recency", "usefulness": "number"}
-        weights: Optional dictionary of weights for each column (default: 1.0 for text, 0.5 for others).
-                Example: {"body": 1.0, "created_at": 0.5, "usefulness": 0.5}
-        recreate: Optional boolean to force recreation of existing index (default: False).
-                 If True, deletes existing index and creates new one with updated mappings/weights.
-                 Use this when you want to:
-                 - Change column mappings
-                 - Update weights
-                 - Reload data with different settings
-                 Example: recreate=True
-
-    Returns:
-        JSON string with status, index name, and document count
-
-    Example:
-        create_index(
-            "/path/to/data.csv",
-            {"body": "text_similarity", "created_at": "recency"},
-            {"body": 1.0, "created_at": 0.5},
-            recreate=False
-        )
+        csv_path: Path to CSV file
+        column_mapping: Which columns to index and their types
+        recreate: If True, delete and recreate the index if it exists (default: False)
     """
-    # Handle weights being passed as JSON string from MCP
-    if isinstance(weights, str):
-        try:
-            weights = json.loads(weights)
-        except json.JSONDecodeError as e:
-            return json.dumps({
-                "error": f"Invalid weights format. Expected dictionary, got malformed JSON string: {weights}",
-                "json_error": str(e)
-            })
-
     try:
-        # Validate path
-        path = Path(csv_path)
-        if not path.exists():
-            return json.dumps({
-                "error": f"File not found: {csv_path}"
-            })
+        index_name = Path(csv_path).stem
+        was_recreated = False
+        client = get_qdrant_client()
 
-        # Validate column_mapping
-        valid_types = ["text_similarity", "recency", "number"]
-        for col, space_type in column_mapping.items():
-            if space_type not in valid_types:
+        # Check if metadata for this index exists
+        metadata_collection = "_sl_metadata"
+        collections = [c.name for c in client.get_collections().collections]
+
+        # Generate consistent UUID from index name
+        point_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, index_name))
+
+        metadata_exists = False
+        if metadata_collection in collections:
+            try:
+                existing = client.retrieve(metadata_collection, ids=[point_uuid])
+                metadata_exists = len(existing) > 0
+            except:
+                pass
+
+        if metadata_exists:
+            if recreate:
+                # Delete metadata and data collection if it exists
+                client.delete(
+                    collection_name=metadata_collection,
+                    points_selector=Filter(
+                        must=[
+                            FieldCondition(
+                                key="index_name",
+                                match=MatchValue(value=index_name)
+                            )
+                        ]
+                    )
+                )
+                if index_name in collections:
+                    client.delete_collection(index_name)
+                print(f"Deleted existing index: {index_name}")
+                was_recreated = True
+            else:
                 return json.dumps({
-                    "error": f"Invalid space type '{space_type}' for column '{col}'",
-                    "valid_types": valid_types
+                    "status": "exists",
+                    "message": f"Index '{index_name}' already exists. Use recreate=True to overwrite."
                 })
 
-        # Check if at least one text_similarity space exists
-        if "text_similarity" not in column_mapping.values():
-            return json.dumps({
-                "error": "At least one column must be mapped to 'text_similarity'",
-                "suggestion": "Add a text column with type 'text_similarity'"
-            })
+        # Load CSV to get schema info
+        df = pd.read_csv(csv_path)
 
-        # Create index (with optional recreation)
-        result = create_index_and_load(csv_path, column_mapping, weights, recreate)
+        # Auto-detect types if "auto"
+        final_mapping = {}
+        for col, space_type in column_mapping.items():
+            if col not in df.columns:
+                return json.dumps({"error": f"Column '{col}' not found in CSV"})
+
+            if space_type == "auto":
+                final_mapping[col] = detect_column_type(df, col)
+            else:
+                final_mapping[col] = space_type
+
+        # Store metadata in a separate collection
+        # Don't create the data collection - let Superlinked handle that
+        metadata_collection = "_sl_metadata"
+
+        # Create metadata collection if it doesn't exist
+        collections = [c.name for c in client.get_collections().collections]
+        if metadata_collection not in collections:
+            client.create_collection(
+                collection_name=metadata_collection,
+                vectors_config=VectorParams(size=1, distance=Distance.COSINE)
+            )
+
+        # Store metadata with index name as the ID
+        metadata = {
+            "_is_metadata": True,
+            "index_name": index_name,
+            "csv_filename": Path(csv_path).name,
+            "column_mapping": final_mapping,
+            "total_rows": len(df)
+        }
+
+        client.upsert(
+            collection_name=metadata_collection,
+            points=[PointStruct(
+                id=point_uuid,  # Use UUID derived from index name
+                vector=[0.0],  # Dummy vector
+                payload=metadata
+            )]
+        )
+
+        # Start server to load data
+        print(f"Starting server to load {index_name}...")
+        subprocess.run(["pkill", "-9", "-f", "superlinked.server"], capture_output=True)
+        time.sleep(2)
+
+        env = os.environ.copy()
+        env["APP_MODULE_PATH"] = "app"
+
+        subprocess.Popen(
+            [sys.executable, "-m", "superlinked.server"],
+            env=env,
+            cwd=str(WORK_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+        # Wait for server
+        for _ in range(SERVER_STARTUP_TIMEOUT):
+            try:
+                r = requests.get(f"http://localhost:{SERVER_PORT}/health", timeout=1)
+                if r.status_code == 200:
+                    break
+            except:
+                time.sleep(1)
+
+        # Trigger data load
+        time.sleep(DATA_LOAD_WAIT)
+
+        return json.dumps({
+            "status": "success",
+            "index_name": index_name,
+            "columns": final_mapping,
+            "rows": len(df),
+            "recreated": was_recreated
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def list_indexes() -> str:
+    """List all available indexes (Qdrant collections)."""
+    try:
+        client = get_qdrant_client()
+        collections = client.get_collections().collections
+
+        result = []
+        for c in collections:
+            # Get full collection info
+            collection_info = client.get_collection(c.name)
+            info = {
+                "name": c.name,
+                "vectors_count": collection_info.vectors_count or 0,
+                "points_count": collection_info.points_count or 0
+            }
+            result.append(info)
 
         return json.dumps(result, indent=2)
-
     except Exception as e:
-        return json.dumps({
-            "error": str(e),
-            "type": type(e).__name__
-        })
+        return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
-def list_available_indexes() -> str:
+def query_index(index_name: str, query_text: str, limit: int = 5) -> str:
     """
-    ⚠️ CRITICAL: ALWAYS call this tool FIRST in Claude Desktop if there is ANY question about a specific index or file.
-
-    This tool MUST be called BEFORE any other tool (including Claude Desktop's internal tools like Read, Glob, etc.)
-    when the user asks about indexing or querying any file.
-
-    List all existing indexes that have been created.
-
-    MANDATORY WORKFLOW - CALL THIS FIRST:
-    1. User asks ANY question about indexing/querying a CSV file or mentions a specific file
-    2. ⚠️ Call list_available_indexes FIRST - do NOT use any other tools yet
-    3. If index exists (CSV filename matches an index name), skip directly to query_indexed_data
-    4. If index does NOT exist, then call preview_csv to inspect the CSV structure
-    5. Then call create_index to create the new index
-
-    The index name matches the CSV filename without extension.
-    Example: "sample_data.csv" creates index named "sample_data"
-
-    Returns:
-        JSON string with list of index names
-
-    Example:
-        list_available_indexes()  # Returns: {"indexes": ["sample_data", "employees", "products"]}
-    """
-    try:
-        indexes = list_indexes()
-
-        return json.dumps({
-            "indexes": indexes,
-            "count": len(indexes)
-        }, indent=2)
-
-    except Exception as e:
-        return json.dumps({
-            "error": str(e),
-            "type": type(e).__name__
-        })
-
-
-@mcp.tool()
-def query_indexed_data(
-    index_name: str,
-    query: str,
-    limit: int = 5,
-    weights: Optional[Union[Dict[str, float], str]] = None
-) -> str:
-    """
-    Query an existing index with natural language to retrieve relevant documents.
-
-    IMPORTANT: Before calling this tool, use list_available_indexes to confirm the index exists.
-    If the index doesn't exist, you'll need to create it first.
-
-    This tool searches the specified index using semantic similarity and returns
-    the most relevant documents with their scores and content.
-
-    The index_name should match the CSV filename (without extension).
-    Example: For "sample_data.csv", use index_name="sample_data"
+    Query an index with natural language.
 
     Args:
-        index_name: Name of the index to query (same as CSV filename without extension)
-        query: Natural language query string
-        limit: Maximum number of results to return (default: 5)
-        weights: Optional dictionary to override default space weights.
-                Example: {"body": 1.5, "created_at": 0.3}
-
-    Returns:
-        JSON string with array of results containing scores and document fields
-
-    Example:
-        query_indexed_data(
-            "employees",
-            "vacation policy",
-            limit=3
-        )
+        index_name: Name of the index to query
+        query_text: Natural language query
+        limit: Max results (default: 5)
     """
-    # Handle weights being passed as JSON string from MCP
-    if isinstance(weights, str):
+    try:
+        # Check server is running
         try:
-            weights = json.loads(weights)
-        except json.JSONDecodeError as e:
-            return json.dumps({
-                "error": f"Invalid weights format. Expected dictionary, got malformed JSON string: {weights}",
-                "json_error": str(e)
+            r = requests.get(f"http://localhost:{SERVER_PORT}/health", timeout=2)
+            if r.status_code != 200:
+                raise Exception("Server not running")
+        except:
+            # Start server
+            env = os.environ.copy()
+            env["APP_MODULE_PATH"] = "app"
+
+            subprocess.Popen(
+                [sys.executable, "-m", "superlinked.server"],
+                env=env,
+                cwd=str(WORK_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            # Wait for startup
+            for _ in range(SERVER_STARTUP_TIMEOUT):
+                try:
+                    r = requests.get(f"http://localhost:{SERVER_PORT}/health", timeout=1)
+                    if r.status_code == 200:
+                        break
+                except:
+                    time.sleep(1)
+
+        # Query
+        url = f"http://localhost:{SERVER_PORT}/api/v1/search/{index_name}_query"
+        payload = {"search_query": query_text, "limit": limit}
+
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+
+        results = response.json()
+        entries = results.get('entries', [])
+
+        parsed = []
+        for entry in entries:
+            parsed.append({
+                "id": entry.get("id"),
+                "score": entry.get("metadata", {}).get("score", 0),
+                "fields": entry.get("fields", {})
             })
 
-    try:
-        # Execute query (query_index will validate index exists)
-        results = query_index(index_name, query, limit, weights)
-
-        return json.dumps({
-            "index_name": index_name,
-            "query": query,
-            "limit": limit,
-            "results": results,
-            "result_count": len(results)
-        }, indent=2)
+        return json.dumps(parsed, indent=2)
 
     except Exception as e:
-        return json.dumps({
-            "error": str(e),
-            "type": type(e).__name__
-        })
+        return json.dumps({"error": str(e)})
 
 
 if __name__ == "__main__":
-    # Run the MCP server with stdio transport for Claude Desktop
     mcp.run(transport="stdio")
