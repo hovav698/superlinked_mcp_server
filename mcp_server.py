@@ -60,13 +60,14 @@ def preview_file(file_path: str, rows: int = 5) -> str:
 
 
 @mcp.tool()
-def create_index(file_path: str, column_mapping: dict) -> str:
+def create_index(file_path: str, column_mapping: dict, weights: dict) -> str:
     """
     Create a semantic search index from structured data using Superlinked's InMemoryExecutor.
 
     Use this tool to:
     - Build a searchable vector index from structured data (CSV or JSON)
     - Combine multiple search dimensions (text similarity, recency, categories, numbers)
+    - Customize the importance of each dimension with weights
 
     When to use:
     - After previewing the file with preview_file() to understand the data structure
@@ -79,15 +80,21 @@ def create_index(file_path: str, column_mapping: dict) -> str:
     - 'number': For numeric fields (prices, ratings, counts, etc.)
     - 'category': For categorical fields (tags, types, labels, etc.)
 
+
     The index is stored in memory and can be queried with query_index().
 
     Args:
         file_path: Path to data file to index (CSV or JSON)
         column_mapping: Dict mapping column names to space types
                        Example: {"description": "text_similarity", "timestamp": "recency"}
+        weights: Dict mapping column names to weight values. The ratio of the weight values is the importance of the column in the search ranking.
+                Example: {"description": 0.8, "timestamp": 0.3}
+                Higher weights = more influence on search ranking.
+                Choose initial weight values as you think is appropriate if not specified otherwise by the user.
+
 
     Returns:
-        JSON with: status, index name, column configuration, ingestion statistics
+        JSON with: status, index name, column configuration, weights used, ingestion statistics
     """
     try:
         index_name = Path(file_path).stem
@@ -105,7 +112,7 @@ def create_index(file_path: str, column_mapping: dict) -> str:
 
         # Create app with InMemoryExecutor
         logging.info(f"Creating InMemoryExecutor app for {index_name}...")
-        app, source, query = create_app(file_path, final_mapping)
+        app, source, query = create_app(file_path, final_mapping, weights)
 
         # Ingest data via InMemorySource
         logging.info(f"Ingesting {len(df)} rows...")
@@ -140,14 +147,20 @@ def create_index(file_path: str, column_mapping: dict) -> str:
             'source': source
         }
 
-        return json.dumps({
+        result = {
             "status": "success",
             "index_name": index_name,
             "columns": final_mapping,
             "rows": len(df),
             "ingested": ingested,
             "errors": errors
-        }, indent=2)
+        }
+
+        # Include weights in response if provided
+        if weights:
+            result["weights"] = weights
+
+        return json.dumps(result, indent=2)
 
     except Exception as e:
         return json.dumps({"error": str(e)})

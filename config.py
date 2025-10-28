@@ -1,11 +1,13 @@
 """
 Simple configuration for Superlinked MCP Server.
 """
-import os
 from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Claude Model - Change this to use a different model
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 # Embedding Model
 EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
@@ -18,15 +20,6 @@ SPACE_TYPE_TO_SCHEMA_FIELD = {
     "number": "Float",
     "category": "String"
 }
-
-# Consolidated weight mapping
-SPACE_TYPE_WEIGHTS = {
-    "text_similarity": 1.0,
-    "recency": 0.3,
-    "number": 0.3,
-    "category": 0.5
-}
-
 
 # Server
 SERVER_PORT = 8080

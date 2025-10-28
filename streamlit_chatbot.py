@@ -4,10 +4,12 @@ Maintains a persistent Claude client for conversation continuity.
 """
 import streamlit as st
 import asyncio
+import json
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 from pathlib import Path
 from dotenv import load_dotenv
 import nest_asyncio
+from config import CLAUDE_MODEL
 
 # Allow nested event loops (fixes Streamlit async issues)
 nest_asyncio.apply()
@@ -21,6 +23,7 @@ def get_client_options():
     mcp_server_path = Path(__file__).parent / "mcp_server.py"
 
     options = ClaudeAgentOptions(
+        model=CLAUDE_MODEL,  # Use model from config.py
         mcp_servers={
             "superlinked-rag": {
                 "command": "python",
@@ -108,11 +111,11 @@ async def stream_query_with_updates(client, user_input: str, steps_placeholder):
 
                     if block_type == "ToolResultBlock":
                         error = getattr(block, 'is_error', False)
-                        result_content = getattr(block, 'content', 'Success')
+                        result_content = getattr(block, 'content', 'No content')
                         steps.append({
                             "type": "tool_result",
                             "error": error,
-                            "content": result_content if error else "Success"
+                            "content": result_content
                         })
                         # Update display immediately
                         update_steps_display(steps_placeholder, steps)
@@ -146,7 +149,12 @@ def update_steps_display(placeholder, steps):
                     if step["error"]:
                         st.error(f"Error: {step['content']}")
                     else:
-                        st.success(step["content"])
+                        # Try to parse and display as JSON if possible
+                        try:
+                            json_content = json.loads(step["content"])
+                            st.json(json_content)
+                        except:
+                            st.success(step["content"])
 
 
 def display_steps(steps):
@@ -173,7 +181,12 @@ def display_steps(steps):
                 if step["error"]:
                     st.error(f"Error: {step['content']}")
                 else:
-                    st.success(step["content"])
+                    # Try to parse and display as JSON if possible
+                    try:
+                        json_content = json.loads(step["content"])
+                        st.json(json_content)
+                    except:
+                        st.success(step["content"])
 
     st.markdown("---")
 
@@ -200,7 +213,7 @@ def main():
     )
 
     st.title("🤖 RAG Chatbot with Superlinked")
-    st.caption("Ask questions in natural language. I remember our entire conversation! 💬⚡")
+    st.caption(f"Ask questions in natural language. I remember our entire conversation! 💬⚡ | Model: {CLAUDE_MODEL}")
 
     # Initialize session state
     if "messages" not in st.session_state:

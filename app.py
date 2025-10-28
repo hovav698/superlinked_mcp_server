@@ -7,7 +7,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 import logging
-from config import EMBEDDING_MODEL, SPACE_TYPE_TO_SCHEMA_FIELD, SPACE_TYPE_WEIGHTS
+from config import EMBEDDING_MODEL, SPACE_TYPE_TO_SCHEMA_FIELD
 from utils import extract_categories_from_file
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -30,28 +30,28 @@ def create_schema(index_name: str, column_mapping: Dict[str, str]) -> sl.Schema:
     return SchemaClass()
 
 
-def create_text_space(schema: sl.Schema, col: str) -> Tuple[sl.Space, Dict]:
+def create_text_space(schema: sl.Schema, col: str, weight_value: float) -> Tuple[sl.Space, Dict]:
     """Create a text similarity space for a column."""
     space = sl.TextSimilaritySpace(
         text=getattr(schema, col),
         model=EMBEDDING_MODEL
     )
-    weight = {space: sl.Param(f"{col}_weight", default=SPACE_TYPE_WEIGHTS["text_similarity"])}
+    weight = {space: sl.Param(f"{col}_weight", default=weight_value)}
     return space, weight
 
 
-def create_recency_space(schema: sl.Schema, col: str) -> Tuple[sl.Space, Dict]:
+def create_recency_space(schema: sl.Schema, col: str, weight_value: float) -> Tuple[sl.Space, Dict]:
     """Create a recency space for a timestamp column."""
     space = sl.RecencySpace(
         timestamp=getattr(schema, col),
         period_time_list=[sl.PeriodTime(timedelta(days=300))],
         negative_filter=-0.25
     )
-    weight = {space: sl.Param(f"{col}_weight", default=SPACE_TYPE_WEIGHTS["recency"])}
+    weight = {space: sl.Param(f"{col}_weight", default=weight_value)}
     return space, weight
 
 
-def create_number_space(schema: sl.Schema, col: str) -> Tuple[sl.Space, Dict]:
+def create_number_space(schema: sl.Schema, col: str, weight_value: float) -> Tuple[sl.Space, Dict]:
     """Create a number space for a numeric column."""
     space = sl.NumberSpace(
         number=getattr(schema, col),
@@ -59,11 +59,11 @@ def create_number_space(schema: sl.Schema, col: str) -> Tuple[sl.Space, Dict]:
         max_value=1.0,
         mode=sl.Mode.MAXIMUM
     )
-    weight = {space: sl.Param(f"{col}_weight", default=SPACE_TYPE_WEIGHTS["number"])}
+    weight = {space: sl.Param(f"{col}_weight", default=weight_value)}
     return space, weight
 
 
-def create_category_space(schema: sl.Schema, col: str, categories: Optional[List[str]]) -> Optional[Tuple[sl.Space, Dict]]:
+def create_category_space(schema: sl.Schema, col: str, categories: Optional[List[str]], weight_value: float) -> Optional[Tuple[sl.Space, Dict]]:
     """Create a category space for a categorical column."""
     if not categories:
         logging.warning(f"Skipping category space for {col}: no categories available")
@@ -75,12 +75,20 @@ def create_category_space(schema: sl.Schema, col: str, categories: Optional[List
         negative_filter=0.0,
         uncategorized_as_category=True
     )
-    weight = {space: sl.Param(f"{col}_weight", default=SPACE_TYPE_WEIGHTS["category"])}
+    weight = {space: sl.Param(f"{col}_weight", default=weight_value)}
     return space, weight
 
 
-def create_spaces(schema: sl.Schema, column_mapping: Dict[str, str], categories_dict: Dict[str, list]) -> Tuple[List, Dict, Any]:
-    """Create all spaces based on column mapping."""
+def create_spaces(schema: sl.Schema, column_mapping: Dict[str, str], categories_dict: Dict[str, list], custom_weights: Dict[str, float]) -> Tuple[List, Dict, Any]:
+    """
+    Create all spaces based on column mapping.
+
+    Args:
+        schema: The Superlinked schema
+        column_mapping: Mapping of column names to space types
+        categories_dict: Dictionary of categories for categorical columns
+        custom_weights: Dict of {column_name: weight} to set space weights (0.0 to 1.0)
+    """
     space_creators = {
         "text_similarity": create_text_space,
         "recency": create_recency_space,
@@ -97,12 +105,15 @@ def create_spaces(schema: sl.Schema, column_mapping: Dict[str, str], categories_
         if not creator:
             continue
 
+        # Get weight for this column
+        weight_value = custom_weights.get(col, 1.0)  # Default to 1.0 if not specified
+
         # Call creator with appropriate arguments
         if space_type == "category":
             categories = categories_dict.get(col, [])
-            result = creator(schema, col, categories)
+            result = creator(schema, col, categories, weight_value)
         else:
-            result = creator(schema, col)
+            result = creator(schema, col, weight_value)
 
         if result:
             space, weight = result
@@ -116,13 +127,14 @@ def create_spaces(schema: sl.Schema, column_mapping: Dict[str, str], categories_
     return spaces, weights, text_space  # text_space needed separately for query
 
 
-def create_app(file_path: str, column_mapping: Dict[str, str]):
+def create_app(file_path: str, column_mapping: Dict[str, str], custom_weights: Dict[str, float]):
     """
     Create an InMemoryExecutor app for the given index configuration.
 
     Args:
         file_path: Path to data file (CSV or JSON, used for index name and category detection)
         column_mapping: Mapping of columns to space types
+        custom_weights: Dict of {column_name: weight} to set space weights (0.0 to 1.0)
 
     Returns:
         Tuple of (app, source, query) where:
@@ -145,8 +157,8 @@ def create_app(file_path: str, column_mapping: Dict[str, str]):
     # Create schema
     schema = create_schema(index_name, column_mapping)
 
-    # Create spaces
-    spaces, weights, text_space = create_spaces(schema, column_mapping, categories_dict)
+    # Create spaces with optional custom weights
+    spaces, weights, text_space = create_spaces(schema, column_mapping, categories_dict, custom_weights)
 
     if not spaces:
         raise ValueError(f"No valid spaces created for {index_name}")
