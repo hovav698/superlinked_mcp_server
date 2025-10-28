@@ -1,188 +1,245 @@
 """
-Dynamic Superlinked app that reads from Qdrant collections.
-Auto-creates indexes for all collections with metadata.
+Dynamic Superlinked app with InMemory VectorDB.
+Reads index config from environment variable (passed directly from MCP tool).
 """
 from superlinked import framework as sl
 from datetime import timedelta
-from qdrant_client import QdrantClient
 from pathlib import Path
+import json
+import os
+import pandas as pd
+from typing import Dict, Any, Optional, List, Tuple, Union
 from config import *
 
-# Connect to Qdrant
-client = QdrantClient(url=QDRANT_URL)
 
-# Get metadata from special metadata collection
-try:
-    collections = client.get_collections().collections
-    collection_names = [c.name for c in collections]
-except Exception as e:
-    print(f"⚠ Could not connect to Qdrant: {e}")
-    collection_names = []
+def load_csv_if_needed(csv_filename: Optional[str], column_mapping: Dict[str, str]) -> Optional[pd.DataFrame]:
+    """Load CSV file if it's needed for category detection."""
+    if not csv_filename:
+        return None
 
-all_indices = []
-all_queries = []
-all_sources = []
+    # Only load CSV if we have category spaces
+    has_category = any(space_type == "category" for space_type in column_mapping.values())
+    if not has_category:
+        return None
 
-# Read all metadata from _sl_metadata collection
-metadata_collection = "_sl_metadata"
-all_metadata = []
-
-if metadata_collection in collection_names:
     try:
-        # Scroll through all points in metadata collection
-        scroll_result = client.scroll(
-            collection_name=metadata_collection,
-            limit=100
-        )
-        all_metadata = scroll_result[0]
-        print(f"✓ Found {len(all_metadata)} metadata entries")
+        return pd.read_csv(csv_filename)
     except Exception as e:
-        print(f"⚠ Could not read metadata: {e}")
+        print(f"⚠ Could not load CSV {csv_filename}: {e}")
+        return None
 
-print(f"Processing {len(all_metadata)} metadata entries...")
-for metadata_point in all_metadata:
-    try:
-        metadata = metadata_point.payload
-        if not metadata.get("_is_metadata"):
-            continue
 
-        index_name = metadata.get("index_name")
-        csv_filename = metadata.get("csv_filename")
-        column_mapping = metadata.get("column_mapping", {})
+def build_schema_fields(column_mapping: Dict[str, str]) -> Dict[str, type]:
+    """Build schema field definitions from column mapping."""
+    schema_fields = {"id": sl.IdField}
 
-        print(f"Processing index: {index_name}, CSV: {csv_filename}")
+    for col, space_type in column_mapping.items():
+        if space_type == "text_similarity":
+            schema_fields[col] = sl.String
+        elif space_type == "recency":
+            schema_fields[col] = sl.Timestamp
+        elif space_type == "number":
+            schema_fields[col] = sl.Float
+        elif space_type == "category":
+            schema_fields[col] = sl.String
 
-        if not column_mapping:
-            continue
+    return schema_fields
 
-        # Load CSV to detect categories if needed
-        import pandas as pd
-        df = None
-        if csv_filename and any(space_type == "category" for space_type in column_mapping.values()):
-            try:
-                df = pd.read_csv(csv_filename)
-            except Exception as e:
-                print(f"⚠ Could not load CSV {csv_filename}: {e}")
-                continue
 
-        # Dynamically create schema
-        schema_fields = {"id": sl.IdField}
-        for col, space_type in column_mapping.items():
-            if space_type == "text_similarity":
-                schema_fields[col] = sl.String
-            elif space_type == "recency":
-                schema_fields[col] = sl.Timestamp
-            elif space_type == "number":
-                schema_fields[col] = sl.Float
-            elif space_type == "category":
-                schema_fields[col] = sl.String  # Category input is a String field
+def create_schema_class(index_name: str, schema_fields: Dict[str, type]) -> sl.Schema:
+    """Dynamically create a schema class and instantiate it."""
+    SchemaClass = type(
+        f"{index_name.capitalize()}Schema",
+        (sl.Schema,),
+        {"__annotations__": schema_fields}
+    )
+    return SchemaClass()
 
-        SchemaClass = type(
-            f"{index_name.capitalize()}Schema",
-            (sl.Schema,),
-            {"__annotations__": schema_fields}
-        )
-        schema = SchemaClass()
 
-        # Create spaces
-        spaces = []
-        weights = {}
-        text_space = None
+def create_text_space(schema: sl.Schema, col: str) -> Tuple[sl.Space, Dict]:
+    """Create a text similarity space for a column."""
+    space = sl.TextSimilaritySpace(
+        text=getattr(schema, col),
+        model=EMBEDDING_MODEL
+    )
+    weight = {space: sl.Param(f"{col}_weight", default=TEXT_WEIGHT)}
+    return space, weight
 
-        for col, space_type in column_mapping.items():
-            if space_type == "text_similarity":
-                space = sl.TextSimilaritySpace(
-                    text=sl.chunk(getattr(schema, col), CHUNK_SIZE, CHUNK_OVERLAP),
-                    model=EMBEDDING_MODEL
-                )
-                weights[space] = sl.Param(f"{col}_weight", default=TEXT_WEIGHT)
-                if not text_space:
-                    text_space = space
 
-            elif space_type == "recency":
-                space = sl.RecencySpace(
-                    timestamp=getattr(schema, col),
-                    period_time_list=[sl.PeriodTime(timedelta(days=300))],
-                    negative_filter=-0.25
-                )
-                weights[space] = sl.Param(f"{col}_weight", default=RECENCY_WEIGHT)
+def create_recency_space(schema: sl.Schema, col: str) -> Tuple[sl.Space, Dict]:
+    """Create a recency space for a timestamp column."""
+    space = sl.RecencySpace(
+        timestamp=getattr(schema, col),
+        period_time_list=[sl.PeriodTime(timedelta(days=300))],
+        negative_filter=-0.25
+    )
+    weight = {space: sl.Param(f"{col}_weight", default=RECENCY_WEIGHT)}
+    return space, weight
 
-            elif space_type == "number":
-                space = sl.NumberSpace(
-                    number=getattr(schema, col),
-                    min_value=0.0,
-                    max_value=1.0,
-                    mode=sl.Mode.MAXIMUM
-                )
-                weights[space] = sl.Param(f"{col}_weight", default=NUMBER_WEIGHT)
 
-            elif space_type == "category":
-                # Get unique categories from CSV data
-                if df is not None and col in df.columns:
-                    categories = df[col].dropna().unique().tolist()
-                    categories = [str(cat) for cat in categories]  # Ensure strings
+def create_number_space(schema: sl.Schema, col: str) -> Tuple[sl.Space, Dict]:
+    """Create a number space for a numeric column."""
+    space = sl.NumberSpace(
+        number=getattr(schema, col),
+        min_value=0.0,
+        max_value=1.0,
+        mode=sl.Mode.MAXIMUM
+    )
+    weight = {space: sl.Param(f"{col}_weight", default=NUMBER_WEIGHT)}
+    return space, weight
 
-                    space = sl.CategoricalSimilaritySpace(
-                        category_input=getattr(schema, col),
-                        categories=categories,
-                        negative_filter=0.0,
-                        uncategorized_as_category=True
-                    )
-                    weights[space] = sl.Param(f"{col}_weight", default=CATEGORY_WEIGHT)
-                else:
-                    print(f"⚠ Skipping category space for {col}: no data available")
-                    continue
 
-            spaces.append(space)
+def create_category_space(schema: sl.Schema, col: str, df: Optional[pd.DataFrame]) -> Optional[Tuple[sl.Space, Dict]]:
+    """Create a category space for a categorical column."""
+    if df is None or col not in df.columns:
+        print(f"⚠ Skipping category space for {col}: no data available")
+        return None
 
-        # Create index
-        index = sl.Index(spaces)
-        all_indices.append(index)
+    categories = df[col].dropna().unique().tolist()
+    categories = [str(cat) for cat in categories]
 
-        # Create query
-        if text_space:
-            query = (
-                sl.Query(index, weights=weights)
-                .find(schema)
-                .similar(text_space.text, sl.Param("search_query"))
-                .select_all()
-                .limit(sl.Param("limit"))
-            )
-            all_queries.append(
-                sl.RestQuery(
-                    sl.RestDescriptor(f"{index_name}_query"),
-                    query
-                )
-            )
+    space = sl.CategoricalSimilaritySpace(
+        category_input=getattr(schema, col),
+        categories=categories,
+        negative_filter=0.0,
+        uncategorized_as_category=True
+    )
+    weight = {space: sl.Param(f"{col}_weight", default=CATEGORY_WEIGHT)}
+    return space, weight
 
-        # Data sources
-        all_sources.append(sl.RestSource(schema))
 
-        if csv_filename:
-            # Construct full path if only filename is stored
-            csv_path = Path(csv_filename)
-            if not csv_path.is_absolute():
-                csv_path = WORK_DIR / csv_filename
+def create_spaces(schema: sl.Schema, column_mapping: Dict[str, str], df: Optional[pd.DataFrame]) -> Tuple[List, Dict, Any]:
+    """Create all spaces based on column mapping."""
+    spaces = []
+    weights = {}
+    text_space = None  # Track first text space for query building
 
-            print(f"Loading CSV from: {csv_path} (exists: {csv_path.exists()})")
+    for col, space_type in column_mapping.items():
+        result = None
 
-            if csv_path.exists():
-                loader = sl.DataLoaderSource(
-                    schema,
-                    sl.DataLoaderConfig(str(csv_path), sl.DataFormat.CSV)
-                )
-                all_sources.append(loader)
-            else:
-                print(f"⚠ CSV file not found: {csv_path}")
+        if space_type == "text_similarity":
+            space, weight = create_text_space(schema, col)
+            # Keep reference to first text space - needed for .similar() in query
+            if not text_space:
+                text_space = space
+            result = (space, weight)
 
-        print(f"✓ Loaded index: {index_name}")
+        elif space_type == "recency":
+            result = create_recency_space(schema, col)
 
-    except Exception as e:
-        print(f"⚠ Skipping {index_name}: {e}")
+        elif space_type == "number":
+            result = create_number_space(schema, col)
 
-# Create executor if we have indexes
-if all_indices:
-    vector_db = sl.QdrantVectorDatabase(QDRANT_URL, "")
+        elif space_type == "category":
+            result = create_category_space(schema, col, df)
+
+        if result:
+            space, weight = result
+            spaces.append(space)  # All spaces go here (including text_space)
+            weights.update(weight)
+
+    return spaces, weights, text_space  # text_space needed separately for query
+
+
+def create_query(index: sl.Index, schema: sl.Schema, weights: Dict, text_space: Any, index_name: str) -> Optional[sl.RestQuery]:
+    """Create a REST query for the index."""
+    if not text_space:
+        return None
+
+    query = (
+        sl.Query(index, weights=weights)
+        .find(schema)
+        .similar(text_space.text, sl.Param("search_query"))
+        .select_all()
+        .limit(sl.Param("limit"))
+    )
+
+    return sl.RestQuery(
+        sl.RestDescriptor(f"{index_name}_query"),
+        query
+    )
+
+
+def create_data_sources(schema: sl.Schema) -> List:
+    """
+    Create data sources for the schema.
+
+    Only RestSource - data loaded manually via ingest_csv_data().
+    DataLoaderSource doesn't work reliably (CSV not loading).
+    """
+    # RestSource creates HTTP endpoint for manual data ingestion
+    return [sl.RestSource(schema)]
+
+
+def process_single_index(index_name: str, metadata: Dict[str, Any]) -> Tuple[Optional[sl.Index], Optional[sl.RestQuery], List]:
+    """Process a single index from metadata and return index, query, and sources."""
+    csv_filename = metadata.get("csv_filename")
+    column_mapping = metadata.get("column_mapping", {})
+
+    print(f"Processing index: {index_name}, CSV: {csv_filename}")
+
+    if not column_mapping:
+        return None, None, []
+
+    # Load CSV if needed for category detection
+    df = load_csv_if_needed(csv_filename, column_mapping)
+
+    # Create schema
+    schema_fields = build_schema_fields(column_mapping)
+    schema = create_schema_class(index_name, schema_fields)
+
+    # Create spaces
+    spaces, weights, text_space = create_spaces(schema, column_mapping, df)
+
+    if not spaces:
+        print(f"⚠ No valid spaces created for {index_name}")
+        return None, None, []
+
+    # Create index
+    index = sl.Index(spaces)
+
+    # Create query
+    query = create_query(index, schema, weights, text_space, index_name)
+
+    # Create data sources (REST endpoint only - manual ingestion)
+    sources = create_data_sources(schema)
+
+    print(f"✓ Loaded index: {index_name}")
+    return index, query, sources
+
+
+def initialize_server():
+    """Initialize Superlinked server. Loads indexes from environment variable if present."""
+    all_indices = []
+    all_queries = []
+    all_sources = []
+
+    # Read metadata from environment variable (passed by MCP tool)
+    metadata_json = os.environ.get('INDEX_METADATA')
+    if metadata_json:
+        try:
+            all_metadata = json.loads(metadata_json)
+
+            # Get the single index (only one per server instance)
+            if len(all_metadata) != 1:
+                print(f"⚠ Warning: Expected 1 index, found {len(all_metadata)}")
+
+            index_name, index_config = next(iter(all_metadata.items()))
+            print(f"✓ Loading index: {index_name}")
+
+            index, query, sources = process_single_index(index_name, index_config)
+
+            if index:
+                all_indices.append(index)
+            if query:
+                all_queries.append(query)
+            all_sources.extend(sources)
+
+        except Exception as e:
+            print(f"⚠ Could not load index: {e}")
+
+    # Create executor
+    vector_db = sl.InMemoryVectorDatabase()
 
     executor = sl.RestExecutor(
         sources=all_sources,
@@ -192,6 +249,12 @@ if all_indices:
     )
 
     sl.SuperlinkedRegistry.register(executor)
-    print(f"✓ Server ready with {len(all_indices)} index(es)")
-else:
-    print("⚠ No indexes found - create one with create_index tool")
+
+    if all_indices:
+        print(f"✓ Server ready with {len(all_indices)} index(es)")
+    else:
+        print("✓ Server ready (empty - use MCP create_index tool)")
+
+
+# Initialize the server
+initialize_server()
