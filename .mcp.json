@@ -3,7 +3,7 @@
     "superlinked-rag": {
       "command": "/Users/hovav/miniconda3/envs/rag_test/bin/python",
       "args": [
-        "/Users/hovav/projects/rag_repo/mcp_tools/mcp_server.py"
+        "/Users/hovav/projects/rag_repo/mcp_server.py"
       ]
     }
   }
