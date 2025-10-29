@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 import logging
 from config import EMBEDDING_MODEL, SPACE_TYPE_TO_SCHEMA_FIELD
-from utils import extract_categories_from_file
+from file_processing import extract_categories_from_file
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 

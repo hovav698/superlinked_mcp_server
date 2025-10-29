@@ -7,7 +7,9 @@ import asyncio
 import json
 from dotenv import load_dotenv
 import nest_asyncio
-from claude_client import create_client, connect_client, disconnect_client, stream_query, get_model
+from claude_client import create_client, connect_client, disconnect_client, stream_query
+from config import CLAUDE_MODEL
+
 
 # Allow nested event loops (fixes Streamlit async issues)
 nest_asyncio.apply()
@@ -201,7 +203,7 @@ def main():
     )
 
     st.title("🤖 RAG Chatbot with Superlinked")
-    st.caption(f"Ask questions in natural language 💬⚡ | Model: {get_model()}")
+    st.caption(f"Ask questions in natural language 💬⚡ | Model: {CLAUDE_MODEL}")
 
     # Initialize session state
     if "messages" not in st.session_state:
@@ -295,7 +297,7 @@ def main():
         - **MCP** for tool integration
 
         ### Example Conversation:
-        1. "I have this file: sample_data/business_news.csv, Who wanted to have strike?"
+        1. "I have this file: sample_data/business_news.json, Who wanted to have strike?"
         2. "This news is old, put more weight on the date"
         3. "Any news related to gas? What does it say?"
 

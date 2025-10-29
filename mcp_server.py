@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from config import *
 from app import create_app
-from utils import load_file, resolve_file_path, prepare_dataframe_for_ingestion
+from file_processing import load_file, resolve_file_path, prepare_dataframe
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -121,7 +121,8 @@ def create_index(file_path: str, column_mapping: dict, weights: dict) -> str:
         app, source, query = create_app(str(resolved_path), final_mapping, weights)
 
         # Prepare DataFrame for ingestion
-        records = prepare_dataframe_for_ingestion(df, final_mapping)
+        df_prepared = prepare_dataframe(df, final_mapping)
+        records = df_prepared.to_dict('records')
 
         # Ingest all data at once
         logging.info(f"Ingesting {len(records)} rows at once...")

@@ -7,16 +7,6 @@ from pathlib import Path
 from config import CLAUDE_MODEL
 
 
-def get_model():
-    """
-    Get the configured Claude model name.
-
-    Returns:
-        str: Claude model identifier
-    """
-    return CLAUDE_MODEL
-
-
 def get_client_options():
     """
     Create and return MCP client options.

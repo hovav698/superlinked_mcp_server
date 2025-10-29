@@ -51,13 +51,13 @@ cd rag_repo
 pip install -r requirements.txt
 ```
 
-3. Create a `.env` file with your configuration:
+3. Set required environment variable:
 ```bash
-# Claude Model (for Streamlit demo)
-CLAUDE_MODEL=claude-haiku-4-5-20251001
+# Required for Streamlit demo
+export ANTHROPIC_API_KEY=your_api_key_here
 
-# Anthropic API key (required for Streamlit demo)
-ANTHROPIC_API_KEY=your_api_key_here
+# Optional: Change Claude model (default: claude-haiku-4-5-20251001)
+export CLAUDE_MODEL=claude-haiku-4-5-20251001
 ```
 
 ## MCP Server Tools
@@ -66,7 +66,7 @@ The server provides three main tools:
 
 ### 1. `preview_file`
 
-Preview the structure and contents of a data file before indexing.
+Preview the structure and contents of a data file before indexing. Use this tool to understand your data structure and decide which spaces to create for indexing.
 
 **Parameters:**
 - `file_path` (string): Path to data file (CSV or JSON)
@@ -78,7 +78,7 @@ Preview the structure and contents of a data file before indexing.
 - Sample records
 
 **Example use case:**
-"Show me what's in sample_data/business_news.csv"
+"Show me what's in sample_data/business_news.json"
 
 ### 2. `create_index`
 
@@ -102,7 +102,7 @@ Create a searchable vector index from structured data.
 - Applied weights
 
 **Example use case:**
-"Create an index from business_news.csv with text search on the description field and recency on the date field. Put more weight on the description."
+"Create an index from business_news.json with text search on the description field and recency on the date field. Put more weight on the description."
 
 ### 3. `query_index`
 
@@ -152,31 +152,19 @@ To use this server with Claude Desktop:
    - Create vector indexes
    - Perform semantic searches
 
-### Other MCP Clients
 
-Any MCP-compatible client can connect to this server using stdio transport. Configure it with:
-- **Command**: `python`
-- **Args**: `["/path/to/mcp_server.py"]`
-- **Transport**: `stdio`
-
-## Streamlit Demo App
+### Streamlit Demo App
 
 This repository includes a Streamlit chatbot demo that uses the Claude Agent SDK as an MCP client. This demonstrates how to build a conversational interface with the MCP server.
 
 ### Running the Demo
 
-1. Ensure your `.env` file has the required configuration:
-```bash
-ANTHROPIC_API_KEY=your_api_key_here
-CLAUDE_MODEL=claude-haiku-4-5-20251001
-```
-
-2. Run the Streamlit app:
+1. Run the Streamlit app:
 ```bash
 streamlit run streamlit_chatbot.py
 ```
 
-3. Open your browser to the provided URL (typically `http://localhost:8501`)
+2. Open your browser to the provided URL (typically `http://localhost:8501`)
 
 ### Demo Features
 
@@ -187,94 +175,13 @@ streamlit run streamlit_chatbot.py
 
 ### Example Conversation Flow
 
-1. "I have this file: sample_data/business_news.csv. Show me what's in it."
+1. "I have this file: sample_data/business_news.json. Show me what's in it."
 2. "Create an index for semantic search on the description field and time-based ranking on the date field."
 3. "Who wanted to have a strike?"
 4. "This news is old, put more weight on the date field."
 5. "Any news related to gas? What does it say?"
 
-## Project Structure
 
-```
-rag_repo/
-├── mcp_server.py           # Main MCP server implementation
-├── app.py                  # Superlinked app creation logic
-├── config.py               # Configuration settings
-├── utils.py                # Utility functions
-├── claude_client.py        # Claude Agent SDK wrapper
-├── streamlit_chatbot.py    # Streamlit demo application
-├── requirements.txt        # Python dependencies
-├── .env                    # Environment variables (create this)
-├── sample_data/            # Example data files
-│   └── business_news.csv
-└── README.md              # This file
-```
-
-## Configuration
-
-Edit `config.py` to customize:
-
-- **CLAUDE_MODEL**: Which Claude model to use in the demo app
-- **EMBEDDING_MODEL**: Sentence transformer model for embeddings (default: `sentence-transformers/all-mpnet-base-v2`)
-
-## Use Cases
-
-This MCP server is ideal for:
-
-- **Document search**: Semantic search over articles, documents, or knowledge bases
-- **Product discovery**: Search products with multiple factors (text, price, category, ratings)
-- **Content recommendation**: Find similar content based on text and metadata
-- **Time-series analysis**: Search with recency bias for news, events, or updates
-- **Customer support**: Search FAQs and support documents with semantic understanding
-
-## Technical Details
-
-### Architecture
-
-- **MCP Server**: FastMCP-based server exposing three tools
-- **Vector Search**: Superlinked InMemoryExecutor with custom spaces
-- **Embeddings**: Sentence transformers (configurable model)
-- **Data Handling**: Pandas for CSV/JSON loading
-- **Demo Client**: Claude Agent SDK with Streamlit UI
-
-### Weights and Ranking
-
-Weights control how much each dimension influences the final ranking:
-- Weights are relative ratios (e.g., 0.8:0.3 = roughly 73%:27%)
-- Higher weight = more influence on similarity scores
-- Default weight is 1.0 if not specified
-- Adjust weights based on your use case
-
-### Limitations
-
-- **In-memory only**: Indexes are not persisted (for production, consider Superlinked Server)
-- **Single session**: Each MCP client session has its own indexes
-- **File formats**: Currently supports CSV and JSON only
-- **Timestamp format**: Recency fields must be Unix timestamps (integer)
-
-## Troubleshooting
-
-### Common Issues
-
-1. **"Index not found" error**: Make sure to create the index before querying
-2. **"Column not found" error**: Verify column names match exactly (case-sensitive)
-3. **Import errors**: Ensure all dependencies are installed: `pip install -r requirements.txt`
-4. **Streamlit connection issues**: Check that your ANTHROPIC_API_KEY is set correctly
-
-### Debug Mode
-
-To enable detailed logging, set the log level in the code:
-```python
-logging.basicConfig(level=logging.DEBUG)
-```
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit issues or pull requests.
-
-## License
-
-[Specify your license here]
 
 ## Resources
 
@@ -283,9 +190,3 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 - [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk)
 - [FastMCP](https://github.com/jlowin/fastmcp)
 
-## Support
-
-For issues or questions:
-- Open an issue on GitHub
-- Check the Superlinked documentation
-- Review MCP protocol specifications
