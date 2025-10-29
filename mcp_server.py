@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from config import *
 from app import create_app
-from utils import load_file
+from utils import load_file, resolve_file_path, prepare_dataframe_for_ingestion
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -37,14 +37,17 @@ def preview_file(file_path: str, rows: int = 5) -> str:
     This should be your first step before creating an index with create_index().
 
     Args:
-        file_path: Path to data file - supports CSV and JSON (absolute or relative to working directory)
+        file_path: Path to data file - supports CSV and JSON (absolute or relative to project directory)
         rows: Number of sample rows to preview (default: 5)
 
     Returns:
         JSON with: total rows, column names, data types, and sample records
     """
     try:
-        df = load_file(file_path)
+        # Resolve relative paths to absolute paths
+        resolved_path = resolve_file_path(file_path)
+
+        df = load_file(str(resolved_path))
         if df is None:
             return json.dumps({"error": f"Could not load file or unsupported format: {file_path}"})
 
@@ -84,7 +87,7 @@ def create_index(file_path: str, column_mapping: dict, weights: dict) -> str:
     The index is stored in memory and can be queried with query_index().
 
     Args:
-        file_path: Path to data file to index (CSV or JSON)
+        file_path: Path to data file to index (CSV or JSON, absolute or relative to project directory)
         column_mapping: Dict mapping column names to space types
                        Example: {"description": "text_similarity", "timestamp": "recency"}
         weights: Dict mapping column names to weight values. The ratio of the weight values is the importance of the column in the search ranking.
@@ -97,8 +100,11 @@ def create_index(file_path: str, column_mapping: dict, weights: dict) -> str:
         JSON with: status, index name, column configuration, weights used, ingestion statistics
     """
     try:
-        index_name = Path(file_path).stem
-        df = load_file(file_path)
+        # Resolve relative paths to absolute paths
+        resolved_path = resolve_file_path(file_path)
+
+        index_name = resolved_path.stem
+        df = load_file(str(resolved_path))
 
         if df is None:
             return json.dumps({"error": f"Could not load file or unsupported format: {file_path}"})
@@ -112,33 +118,16 @@ def create_index(file_path: str, column_mapping: dict, weights: dict) -> str:
 
         # Create app with InMemoryExecutor
         logging.info(f"Creating InMemoryExecutor app for {index_name}...")
-        app, source, query = create_app(file_path, final_mapping, weights)
+        app, source, query = create_app(str(resolved_path), final_mapping, weights)
 
-        # Ingest data via InMemorySource
-        logging.info(f"Ingesting {len(df)} rows...")
-        ingested = 0
+        # Prepare DataFrame for ingestion
+        records = prepare_dataframe_for_ingestion(df, final_mapping)
+
+        # Ingest all data at once
+        logging.info(f"Ingesting {len(records)} rows at once...")
+        source.put(records)
+        ingested = len(records)
         errors = 0
-
-        for _, row in df.iterrows():
-            try:
-                # Build row dict with id + mapped columns
-                row_dict = {'id': str(row.get('id', row.name))}
-
-                for col in final_mapping.keys():
-                    if col in row.index and not pd.isna(row[col]):
-                        value = row[col]
-                        # Convert timestamps to int if needed
-                        if final_mapping[col] == 'recency':
-                            row_dict[col] = int(value)
-                        else:
-                            row_dict[col] = value
-
-                # Use source.put() to ingest
-                source.put([row_dict])
-                ingested += 1
-            except Exception as e:
-                errors += 1
-                logging.error(f"Error ingesting row: {e}")
 
         # Store app instance for querying
         _active_apps[index_name] = {
@@ -156,9 +145,8 @@ def create_index(file_path: str, column_mapping: dict, weights: dict) -> str:
             "errors": errors
         }
 
-        # Include weights in response if provided
-        if weights:
-            result["weights"] = weights
+
+        result["weights"] = weights
 
         return json.dumps(result, indent=2)
 

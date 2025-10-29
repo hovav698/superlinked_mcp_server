@@ -3,14 +3,37 @@ Utility functions for file loading and data processing.
 """
 from pathlib import Path
 import pandas as pd
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import logging
+from config import WORK_DIR
+
+
+def resolve_file_path(file_path: str) -> Path:
+    """
+    Resolve file path to absolute path.
+    If relative path is provided, resolve it relative to WORK_DIR.
+
+    Args:
+        file_path: Absolute or relative file path
+
+    Returns:
+        Absolute Path object
+    """
+    path = Path(file_path)
+
+    # If already absolute, return as-is
+    if path.is_absolute():
+        return path
+
+    # Otherwise, resolve relative to WORK_DIR
+    return WORK_DIR / path
 
 
 def load_file(file_path: str) -> Optional[pd.DataFrame]:
     """
     Load data file and return as DataFrame.
     Supports CSV and JSON formats.
+    Ensures 'id' column exists (required by Superlinked).
     """
     if not file_path:
         return None
@@ -19,12 +42,21 @@ def load_file(file_path: str) -> Optional[pd.DataFrame]:
 
     try:
         if file_ext == '.csv':
-            return pd.read_csv(file_path)
+            df = pd.read_csv(file_path)
         elif file_ext == '.json':
-            return pd.read_json(file_path)
+            df = pd.read_json(file_path)
         else:
             logging.warning(f"Unsupported file type: {file_ext}")
             return None
+
+        # Ensure 'id' column exists (required by Superlinked)
+        if 'id' not in df.columns:
+            df = df.reset_index().rename(columns={'index': 'id'})
+
+        # Convert id to string type (required by Superlinked)
+        df['id'] = df['id'].astype(str)
+
+        return df
     except Exception as e:
         logging.error(f"Could not load file {file_path}: {e}")
         return None
@@ -65,3 +97,33 @@ def extract_categories_from_file(file_path: Optional[str], column_mapping: Dict[
             logging.warning(f"Category column '{col}' not found in file")
 
     return categories_dict
+
+
+def prepare_dataframe_for_ingestion(df: pd.DataFrame, column_mapping: Dict[str, str]) -> List[Dict]:
+    """
+    Prepare DataFrame for Superlinked ingestion.
+
+    - Filters to only include schema columns (id + mapped columns)
+    - Converts recency columns to integers (Unix timestamps)
+    - Converts DataFrame to list of dictionaries
+
+    Args:
+        df: Source DataFrame with 'id' column
+        column_mapping: Mapping of column names to space types
+
+    Returns:
+        List of dictionaries ready for source.put()
+    """
+    # Filter to only schema columns (id + mapped columns)
+    schema_columns = ['id'] + list(column_mapping.keys())
+    df_filtered = df[schema_columns].copy()
+
+    # Convert recency columns to int (Unix timestamps)
+    for col, space_type in column_mapping.items():
+        if space_type == 'recency' and col in df_filtered.columns:
+            df_filtered[col] = df_filtered[col].astype(int)
+
+    # Convert to list of dictionaries
+    records = df_filtered.to_dict('records')
+
+    return records

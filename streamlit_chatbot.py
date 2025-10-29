@@ -5,11 +5,9 @@ Maintains a persistent Claude client for conversation continuity.
 import streamlit as st
 import asyncio
 import json
-from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
-from pathlib import Path
 from dotenv import load_dotenv
 import nest_asyncio
-from config import CLAUDE_MODEL
+from claude_client import create_client, connect_client, disconnect_client, stream_query, get_model
 
 # Allow nested event loops (fixes Streamlit async issues)
 nest_asyncio.apply()
@@ -18,28 +16,13 @@ nest_asyncio.apply()
 load_dotenv()
 
 
-def get_client_options():
-    """Create and return MCP client options."""
-    mcp_server_path = Path(__file__).parent / "mcp_server.py"
-
-    options = ClaudeAgentOptions(
-        model=CLAUDE_MODEL,  # Use model from config.py
-        mcp_servers={
-            "superlinked-rag": {
-                "command": "python",
-                "args": [str(mcp_server_path)],
-                "type": "stdio"
-            }
-        },
-        permission_mode="bypassPermissions"
-    )
-    return options
-
-
 def get_or_create_client():
     """
     Get existing Claude client or create a new one.
-    Uses a workaround to store client connection state.
+    Manages client and event loop in session state.
+
+    Returns:
+        Tuple of (client, event_loop)
     """
     if 'client_loop' not in st.session_state:
         # Create a dedicated event loop for the client
@@ -50,11 +33,10 @@ def get_or_create_client():
         loop = st.session_state.client_loop
         asyncio.set_event_loop(loop)
 
-        options = get_client_options()
-        client = ClaudeSDKClient(options=options)
+        client = create_client()
 
         # Connect the client
-        loop.run_until_complete(client.connect())
+        loop.run_until_complete(connect_client(client))
 
         st.session_state.client = client
         st.session_state.client_connected = True
@@ -62,16 +44,36 @@ def get_or_create_client():
     return st.session_state.client, st.session_state.client_loop
 
 
+def reset_client():
+    """Reset the Claude client connection."""
+    if 'client' in st.session_state and st.session_state.client is not None:
+        try:
+            loop = st.session_state.client_loop
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(disconnect_client(st.session_state.client))
+        except:
+            pass
+
+    st.session_state.client = None
+    st.session_state.client_connected = False
+
+
 async def stream_query_with_updates(client, user_input: str, steps_placeholder):
     """
-    Stream query using persistent client to maintain conversation history.
+    Stream query and parse messages into steps with real-time updates.
+
+    Args:
+        client: ClaudeSDKClient instance
+        user_input: User's query text
+        steps_placeholder: Streamlit placeholder for displaying steps
+
+    Returns:
+        Tuple of (steps, final_result)
     """
     steps = []
     final_result = None
 
-    await client.query(user_input)
-
-    async for message in client.receive_response():
+    async for message in stream_query(client, user_input):
         msg_type = type(message).__name__
 
         # Parse AssistantMessage blocks
@@ -191,20 +193,6 @@ def display_steps(steps):
     st.markdown("---")
 
 
-def reset_client():
-    """Reset the Claude client connection."""
-    if 'client' in st.session_state and st.session_state.client is not None:
-        try:
-            loop = st.session_state.client_loop
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(st.session_state.client.disconnect())
-        except:
-            pass
-
-    st.session_state.client = None
-    st.session_state.client_connected = False
-
-
 def main():
     st.set_page_config(
         page_title="RAG Chatbot",
@@ -213,7 +201,7 @@ def main():
     )
 
     st.title("🤖 RAG Chatbot with Superlinked")
-    st.caption(f"Ask questions in natural language. I remember our entire conversation! 💬⚡ | Model: {CLAUDE_MODEL}")
+    st.caption(f"Ask questions in natural language 💬⚡ | Model: {get_model()}")
 
     # Initialize session state
     if "messages" not in st.session_state:
@@ -307,12 +295,9 @@ def main():
         - **MCP** for tool integration
 
         ### Example Conversation:
-        1. "Preview sample_data.csv"
-        2. "Create an index from that file"
-        3. "Search for machine learning"
-        4. "Now search for cloud computing"
-
-        ↑ Claude remembers the whole conversation!
+        1. "I have this file: sample_data/business_news.csv, Who wanted to have strike?"
+        2. "This news is old, put more weight on the date"
+        3. "Any news related to gas? What does it say?"
 
         ### Features:
         - ⚡ **Real-time streaming** - See steps as they happen
