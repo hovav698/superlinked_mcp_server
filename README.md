@@ -166,6 +166,8 @@ streamlit run streamlit_chatbot.py
 
 2. Open your browser to the provided URL (typically `http://localhost:8501`)
 
+3. IMPORTANT: small unfixed bug - right after fresh environment installation, the MCP server may not load on the first app start. Simply refresh the browser once after the Streamlit app loads — you only need to do this one time and it fix the problem.
+
 ### Demo Features
 
 - **Real-time streaming**: See AI reasoning steps as they happen
